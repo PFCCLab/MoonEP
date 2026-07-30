@@ -59,7 +59,7 @@ def launch_planning_torch_reference(
     # per-rank expert token index into a global one. The global sequence is
     # concatenated in source-rank order.
     tpe_cumsum = tpe.cumsum(dim=0)
-    expert_count = tpe_cumsum[R - 1]
+    expert_count = tpe_cumsum[R - 1].to(dtype=torch.int32)
 
     group_tokens = torch.zeros(R, dtype=expert_count.dtype)
     for h in range(R):
@@ -121,7 +121,8 @@ def launch_planning_torch_reference(
             remaining[local_e] -= take
             quotas[d] -= take
 
-    if not torch.equal(alloc.sum(dim=1), expert_count):
+    allocated_per_expert = alloc.sum(dim=1, dtype=expert_count.dtype)
+    if not bool((allocated_per_expert == expert_count).all().item()):
         raise AssertionError("torch planning reference: per-expert token conservation failed")
     if bool((alloc.sum(dim=0) > CAP).any().item()):
         raise AssertionError("torch planning reference: rank capacity exceeded")
@@ -225,7 +226,14 @@ def launch_planning_torch_reference(
 
         # Find the first dest rank whose cumulative allocation covers g, i.e.
         # the first alloc_cumsum[e, d] > g.
-        dest = int(torch.searchsorted(alloc_cumsum[e], g, right=True).item())
+        search_value = torch.tensor(
+            g, dtype=alloc_cumsum.dtype, device=alloc_cumsum.device
+        )
+        dest = int(
+            torch.searchsorted(
+                alloc_cumsum[e], search_value, right=True
+            ).item()
+        )
         if dest >= R:
             raise AssertionError("torch planning reference: no destination rank found")
 
@@ -264,7 +272,9 @@ def launch_planning_torch_reference(
         for s_tok in range(S):
             base = s_tok * K
             dst_vals = dst_by_rank[src_rank, base:base + K]
-            dests = torch.div(dst_vals, NvS, rounding_mode="floor")
+            dests = torch.div(
+                dst_vals, torch.full_like(dst_vals, NvS), rounding_mode="floor"
+            )
             loffs = dst_vals % NvS
 
             groups = {}
@@ -284,7 +294,11 @@ def launch_planning_torch_reference(
                     dup_groups_by_rank[dest, group_idx, 1] = dup_start
                     dup_groups_by_rank[dest, group_idx, 2] = dup_count
                     dup_loffs_by_rank[dest, dup_start:dup_start + dup_count] = (
-                        dup_loffs_by_rank.new_tensor(group_loffs[1:])
+                        torch.tensor(
+                            group_loffs[1:],
+                            dtype=dup_loffs_by_rank.dtype,
+                            device=dup_loffs_by_rank.device,
+                        )
                     )
                     dup_counts_by_rank[dest, 0] += 1
                     dup_counts_by_rank[dest, 1] += dup_count

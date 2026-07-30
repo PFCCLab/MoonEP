@@ -20,6 +20,7 @@ from tests.kernel_test_utils import (
     gather_tensor,
     init_case,
     make_topk,
+    tensor_equal,
 )
 from tests.planning_reference import launch_planning_torch_reference
 
@@ -149,8 +150,8 @@ def _traceable_weights(rank, S, K):
     weights_i32 = (
         torch.arange(S * K, dtype=torch.int32, device="cuda")
         .reshape(S, K)
-        .add_(rank * S * K)
     )
+    weights_i32 = weights_i32 + rank * S * K
     return weights_i32.view(torch.float32)
 
 
@@ -408,7 +409,7 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
         ctx, case, rank, R, dst_a, check_weights=False, hidden_user=hidden_user
     )
     padding_errors, padding_rows = _zero_row_errors(plan_a.zero_fill_ranges, hidden_user)
-    weights_unchanged = torch.equal(ctx["weights_buf_local"], weights_after_b)
+    weights_unchanged = tensor_equal(ctx["weights_buf_local"], weights_after_b)
     dedup_unchanged = dedup_plan_fields_equal(plan_a, dedup_a_snapshot)
     errors = scatter_errors + padding_errors
     if not weights_unchanged:

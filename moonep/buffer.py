@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import shutil
 import socket
@@ -34,6 +36,24 @@ _ELEM_SIZE = {
 _HANDLE_TYPE_ENV = "MOONEP_MEM_HANDLE_TYPE"
 
 
+def _get_global_rank(group, group_rank: int) -> int:
+    if group is None:
+        return group_rank
+    get_global_rank = getattr(dist, "get_global_rank", None)
+    if get_global_rank is not None:
+        return get_global_rank(group, group_rank)
+    return group.get_global_rank(group_rank)
+
+
+def _all_gather_tensor(
+    local: torch.Tensor,
+    group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, local, group=group)
+    return torch.stack(gathered)
+
+
 def _use_fabric_for_group(group: dist.ProcessGroup | None) -> bool:
     mode = os.environ.get(_HANDLE_TYPE_ENV, "auto").lower()
     assert mode in ("auto", "fabric", "fd"), (
@@ -49,8 +69,7 @@ def _use_fabric_for_group(group: dist.ProcessGroup | None) -> bool:
         unsupported = [] if supported else [0]
     else:
         local = torch.tensor([supported], dtype=torch.uint8, device="cuda")
-        gathered = torch.empty(world_size, dtype=torch.uint8, device="cuda")
-        dist.all_gather_into_tensor(gathered, local, group=group)
+        gathered = _all_gather_tensor(local, group).flatten()
         unsupported = (gathered == 0).nonzero().flatten().tolist()
 
     if mode == "fabric":
@@ -68,12 +87,8 @@ def _all_gather_shareables(
     group: dist.ProcessGroup | None,
 ) -> torch.Tensor:
     """Gather every rank's fabric handle into a uint8[world_size, 64] CPU tensor."""
-    world_size = dist.get_world_size(group=group)
-    gathered = torch.empty(world_size, _FABRIC_HANDLE_BYTES,
-                           dtype=torch.uint8, device="cuda")
-    dist.all_gather_into_tensor(
-        gathered, local_handle.cuda().view(1, _FABRIC_HANDLE_BYTES), group=group)
-    return gathered.cpu()
+    local = local_handle.cuda().view(_FABRIC_HANDLE_BYTES)
+    return _all_gather_tensor(local, group).cpu()
 
 
 def _broadcast_shareable(
@@ -86,8 +101,7 @@ def _broadcast_shareable(
         buf = local_handle.cuda()
     else:
         buf = torch.empty(_FABRIC_HANDLE_BYTES, dtype=torch.uint8, device="cuda")
-    src = dist.get_global_rank(group, owner_rank) if group is not None \
-        else owner_rank
+    src = _get_global_rank(group, owner_rank)
     dist.broadcast(buf, src=src, group=group)
     return buf.cpu()
 
@@ -140,7 +154,7 @@ def _exchange_ipc_fds(
     else:
         dir_path = None
     obj = [dir_path]
-    src = dist.get_global_rank(group, 0) if group is not None else 0
+    src = _get_global_rank(group, 0)
     dist.broadcast_object_list(obj, src=src, group=group)
     dir_path = obj[0]
 
@@ -209,7 +223,9 @@ def _map_nvl_dist_tensor(
             full_tensor = nvl_dist_map(
                 chunk_shape=chunk_shape,
                 dtype=dtype,
-                shareables=torch.tensor(all_fds, dtype=torch.int64),
+                shareables=torch.tensor(
+                    all_fds, dtype=torch.int64, device="cpu"
+                ),
                 local_rank=local_rank,
                 world_size=world_size,
                 use_fabric=False,
@@ -304,7 +320,7 @@ def _create_nvl_multicast_view(
     single chunk (write `mc[off]` hits every rank's chunk `[off]`).
     """
     assert nvl_multicast_supported(), "Multicast not supported on this device"
-    chunk_elems = meta_buf.numel() // world_size
+    chunk_elems = meta_buf.shape.numel() // world_size
     size_bytes = chunk_elems * meta_buf.element_size()
     is_root = local_rank == 0
 
@@ -328,7 +344,9 @@ def _create_nvl_multicast_view(
         try:
             if not is_root:
                 mc_handle = nvl_multicast_import(
-                    torch.tensor(root_fd, dtype=torch.int64), use_fabric=False)
+                    torch.tensor(root_fd, dtype=torch.int64, device="cpu"),
+                    use_fabric=False,
+                )
         finally:
             os.close(root_fd)
 
@@ -384,7 +402,9 @@ def create_nvl_single_owner_tensor(
         try:
             tensor = nvl_dist_map(
                 chunk_shape=shape, dtype=dtype,
-                shareables=torch.tensor([owner_fd], dtype=torch.int64),
+                shareables=torch.tensor(
+                    [owner_fd], dtype=torch.int64, device="cpu"
+                ),
                 local_rank=0, world_size=1, use_fabric=False,
             )
         finally:

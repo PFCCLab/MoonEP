@@ -330,7 +330,7 @@ def launch_prefetch(
             not written by this kernel.
         num_sms: number of persistent CTAs to launch.
     """
-    if prefetch_buffers.numel() == 0 or experts_to_copy.numel() == 0:
+    if prefetch_buffers.shape.numel() == 0 or experts_to_copy.shape.numel() == 0:
         return
 
     assert remote_expert.dtype == torch.bfloat16 and remote_expert.is_contiguous(), \
@@ -348,8 +348,8 @@ def launch_prefetch(
     B, out_H, out_Hp = (int(x) for x in prefetch_buffers.shape)
     assert out_H == H and out_Hp == Hp, \
         f"prefetch_buffers shape {tuple(prefetch_buffers.shape)} incompatible with remote_expert {tuple(remote_expert.shape)}"
-    assert experts_to_copy.numel() == B, \
-        f"experts_to_copy length {experts_to_copy.numel()} must equal B={B}"
+    assert experts_to_copy.shape.numel() == B, \
+        f"experts_to_copy length {experts_to_copy.shape.numel()} must equal B={B}"
     assert H % PrefetchKernel.M_BLOCK == 0 and Hp % PrefetchKernel.N_BLOCK == 0, \
         f"H and H' must be multiples of ({PrefetchKernel.M_BLOCK}, {PrefetchKernel.N_BLOCK}), got ({H}, {Hp})"
     assert isinstance(num_sms, int) and num_sms > 0, \

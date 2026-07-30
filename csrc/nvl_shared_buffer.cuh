@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -13,6 +15,12 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+
+#include "paddle/common/ddim.h"
+#include "paddle/phi/api/include/compat/utils/scalar_type_conversion.h"
+#include "paddle/phi/api/include/tensor.h"
+#include "paddle/phi/core/allocator.h"
+#include "paddle/phi/core/dense_tensor.h"
 
 #ifndef CUCHECK
 #define CUCHECK(cmd) do {                                      \
@@ -47,8 +55,22 @@ static inline bool nvl_fabric_supported() {
     CUresult err = cuDeviceGetAttribute(&supported,
         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cu_device);
     // Older drivers do not know the attribute at all.
-    if (err != CUDA_SUCCESS) return false;
-    return supported != 0;
+    if (err != CUDA_SUCCESS || !supported) return false;
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    size_t size;
+    if (cuMemGetAllocationGranularity(
+            &size, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS)
+        return false;
+
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) return false;
+    CUCHECK(cuMemRelease(handle));
+    return true;
 }
 
 static inline size_t nvl_granularity_for(int device_id,
@@ -103,6 +125,36 @@ static inline std::tuple<size_t, size_t, int> nvl_prepare(
     return {size, allocated_size, device_id};
 }
 
+static inline at::Tensor make_external_cuda_tensor(
+    void *ptr,
+    size_t nbytes,
+    int device_id,
+    const std::vector<int64_t> &shape,
+    at::ScalarType dtype,
+    std::function<void(void *)> deleter
+) {
+    // TODO(Paddle compat): use at::from_blob once it accepts peer/multicast VMM
+    // addresses whose physical allocation device differs from the logical
+    // current device. The holder below preserves that logical place without
+    // changing MoonEP's VMM layout or lifetime.
+    auto holder = std::shared_ptr<phi::Allocation>(
+        new phi::Allocation(
+            ptr, nbytes, phi::GPUPlace(device_id)),
+        [deleter = std::move(deleter)](phi::Allocation *allocation) mutable {
+            if (deleter) {
+                deleter(allocation->ptr());
+            }
+            delete allocation;
+        });
+    auto meta = phi::DenseTensorMeta(
+        compat::_PD_AtenScalarTypeToPhiDataType(dtype),
+        common::make_ddim(shape),
+        phi::DataLayout::NCHW);
+    paddle::Tensor tensor(
+        std::make_shared<phi::DenseTensor>(holder, meta));
+    return at::Tensor(tensor);
+}
+
 static inline at::Tensor make_vmm_tensor(
     void *ptr,
     size_t nbytes,
@@ -119,20 +171,8 @@ static inline at::Tensor make_vmm_tensor(
         cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), allocated_size);
     };
 
-    auto storage = c10::Storage(
-        c10::Storage::use_byte_size_t(),
-        static_cast<int64_t>(nbytes),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            ptr, std::move(deleter), c10::Device(c10::kCUDA, device_id)),
-        /*allocator=*/nullptr,
-        /*resizable=*/false);
-
-    auto impl = c10::make_intrusive<at::TensorImpl>(
-        std::move(storage),
-        c10::DispatchKeySet(c10::DispatchKey::CUDA),
-        c10::scalarTypeToTypeMeta(dtype));
-    impl->set_sizes_contiguous(shape);
-    return at::Tensor(std::move(impl));
+    return make_external_cuda_tensor(
+        ptr, nbytes, device_id, shape, dtype, std::move(deleter));
 }
 
 static constexpr int64_t kFabricHandleBytes =
@@ -286,7 +326,6 @@ inline at::Tensor nvl_dist_map(
         "are a multiple of the allocation granularity.");
 
     size_t total_allocated_size = chunk_allocated_size * world_size;
-    size_t total_nbytes = chunk_nbytes * world_size;
 
     CUdeviceptr dptr;
     CUCHECK(cuMemAddressReserve(&dptr, total_allocated_size, 0, 0, 0));
@@ -310,6 +349,7 @@ inline at::Tensor nvl_dist_map(
 
     std::vector<int64_t> full_shape = chunk_shape;
     full_shape[0] *= world_size;
+    size_t total_nbytes = chunk_nbytes * world_size;
 
     int ws = world_size;
     size_t cas = chunk_allocated_size;
@@ -324,21 +364,9 @@ inline at::Tensor nvl_dist_map(
         cuMemAddressFree(dptr, tas);
     };
 
-    auto storage = c10::Storage(
-        c10::Storage::use_byte_size_t(),
-        static_cast<int64_t>(total_nbytes),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            reinterpret_cast<void *>(dptr), std::move(deleter),
-            c10::Device(c10::kCUDA, device_id)),
-        /*allocator=*/nullptr,
-        /*resizable=*/false);
-
-    auto impl = c10::make_intrusive<at::TensorImpl>(
-        std::move(storage),
-        c10::DispatchKeySet(c10::DispatchKey::CUDA),
-        c10::scalarTypeToTypeMeta(dtype));
-    impl->set_sizes_contiguous(full_shape);
-    return at::Tensor(std::move(impl));
+    return make_external_cuda_tensor(
+        reinterpret_cast<void *>(dptr), total_nbytes, device_id,
+        full_shape, dtype, std::move(deleter));
 }
 
 // ============================================================
@@ -443,7 +471,7 @@ inline int64_t nvl_multicast_import(
     const at::Tensor &shareable, bool use_fabric
 ) {
     auto one = use_fabric ? shareable.view({1, kFabricHandleBytes})
-                          : shareable.view({1});
+                          : shareable.reshape({1});
     nvl_check_handles(one, 1, use_fabric);
     return static_cast<int64_t>(nvl_import_shareable(one, 0, use_fabric));
 }
@@ -512,19 +540,7 @@ inline at::Tensor nvl_multicast_bind_map(
     };
 
     std::vector<int64_t> shape = {static_cast<int64_t>(size / sizeof(int32_t))};
-    auto storage = c10::Storage(
-        c10::Storage::use_byte_size_t(),
-        static_cast<int64_t>(size),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            reinterpret_cast<void*>(mc_va), std::move(deleter),
-            c10::Device(c10::kCUDA, device_id)),
-        /*allocator=*/nullptr,
-        /*resizable=*/false);
-
-    auto impl = c10::make_intrusive<at::TensorImpl>(
-        std::move(storage),
-        c10::DispatchKeySet(c10::DispatchKey::CUDA),
-        c10::scalarTypeToTypeMeta(at::kInt));
-    impl->set_sizes_contiguous(shape);
-    return at::Tensor(std::move(impl));
+    return make_external_cuda_tensor(
+        reinterpret_cast<void*>(mc_va), size, device_id,
+        shape, at::kInt, std::move(deleter));
 }

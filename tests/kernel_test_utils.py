@@ -14,7 +14,18 @@ _ACTIVE_BUFFERS = []
 
 
 def local_device_index() -> int:
-    return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+    for name in (
+        "FLAGS_selected_gpus",
+        "LOCAL_RANK",
+        "PADDLE_LOCAL_RANK",
+        "PADDLE_RANK_IN_NODE",
+        "RANK",
+        "PADDLE_TRAINER_ID",
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            return int(value)
+    return 0
 
 
 def _align_up(x: int, alignment: int) -> int:
@@ -130,13 +141,29 @@ def assert_all_ranks(ok, rank, R, label, detail=""):
         raise AssertionError(f"{label} failed on another rank")
 
 
+def tensor_equal(actual, expected):
+    if tuple(actual.shape) != tuple(expected.shape):
+        return False
+    # Paddle does not register equal_all for bfloat16 on CPU or GPU.
+    # Every bfloat16 value is represented exactly after conversion to float32.
+    equal_actual = actual.float() if actual.dtype == torch.bfloat16 else actual
+    equal_expected = (
+        expected.float() if expected.dtype == torch.bfloat16 else expected
+    )
+    return torch.equal(equal_actual, equal_expected)
+
+
 def assert_tensor_equal_all_ranks(name, actual, expected, rank, R, max_print=5):
     actual_cpu = actual.cpu()
     expected_cpu = expected.cpu()
-    ok = torch.equal(actual_cpu, expected_cpu)
+    equal_actual = actual_cpu.float() if actual_cpu.dtype == torch.bfloat16 else actual_cpu
+    equal_expected = (
+        expected_cpu.float() if expected_cpu.dtype == torch.bfloat16 else expected_cpu
+    )
+    ok = tensor_equal(actual_cpu, expected_cpu)
     detail = ""
     if not ok:
-        diff_mask = actual_cpu != expected_cpu
+        diff_mask = equal_actual != equal_expected
         n_diff = int(diff_mask.sum().item())
         diff_pos = diff_mask.nonzero()[:max_print]
         lines = [f"{n_diff}/{actual_cpu.numel()} elements differ"]
@@ -162,7 +189,7 @@ def clone_dedup_plan_fields(plan):
 
 
 def dedup_plan_fields_equal(plan, snapshot):
-    return all(torch.equal(getattr(plan, field), snapshot[field])
+    return all(tensor_equal(getattr(plan, field), snapshot[field])
                for field in DEDUP_PLAN_FIELDS)
 
 
@@ -366,7 +393,9 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
     else:
         dst_cpu = dst.cpu()
         raw_dst = torch.where(dst_cpu < 0, -dst_cpu - 1, dst_cpu)
-        dest_rank = torch.div(raw_dst, NvS, rounding_mode="floor")
+        dest_rank = torch.div(
+            raw_dst, torch.full_like(raw_dst, NvS), rounding_mode="floor"
+        )
         local_off = raw_dst % NvS
         if not torch.all((dest_rank >= 0) & (dest_rank < R)):
             errors.append("dst contains an out-of-range destination rank")

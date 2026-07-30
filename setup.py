@@ -12,6 +12,10 @@ or, for a quick in-place build without installing:
 The .so lands at `moonep/_C.<abi-tag>.so`.
 """
 
+import paddle
+
+paddle.enable_compat()
+
 import os
 
 from setuptools import find_packages, setup
