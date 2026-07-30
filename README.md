@@ -1,4 +1,27 @@
-# MoonEP
+# MoonEP ❤️ PaddlePaddle
+
+> [!NOTE]
+>
+> This repo is a fork of the original MoonEP project, with modifications to enhance compatibility and integration with PaddlePaddle.
+>
+> **Installation**
+>
+> ```bash
+> pip install paddlepaddle-gpu  # Install PaddlePaddle with GPU support, refer to https://www.paddlepaddle.org.cn/install/quick for more details
+> git clone https://github.com/PFCCLab/MoonEP.git
+> cd MoonEP
+> pip install . --no-build-isolation
+> ```
+>
+> **Usage**
+>
+> ```python
+> import paddle
+> paddle.enable_compat(scope={"moonep"})  # Enable torch compat before importing moonep
+> import moonep
+> # use moonep
+> ```
+>
 
 MoonEP is an Expert Parallelism communication library that keeps token loads perfectly balanced across ranks via dynamic redundant experts.
 
@@ -180,15 +203,33 @@ buffer.destroy()
 ## Build & Test
 
 ```bash
-pip install -e .
+source .venv/bin/activate
+unset PADDLE_TRAINER_ENDPOINTS DISTRIBUTED_TRAINER_ENDPOINTS PADDLE_TRAINER_ID
+pip install -e . --no-build-isolation
+pip install pytest
 
-# run tests (requires multiple GPUs + NVLink)
-torchrun --nproc_per_node=8 -m pytest tests/test_planning.py
-torchrun --nproc_per_node=8 -m pytest tests/test_dispatch.py
-torchrun --nproc_per_node=8 -m pytest tests/test_combine.py
-torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
-torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
-torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
+python -m paddle.distributed.launch \
+  --devices 0,1 \
+  --nproc_per_node 2 \
+  --log_dir logs \
+  pytest -q \
+  'tests/test_combine.py::test_combine_identity_round_trip[all_remote]'
+```
+
+Run the complete unit-test matrix with Paddle. The main matrix uses two GPUs;
+one planning case requires four ranks and is run separately:
+
+```bash
+# Main two-GPU matrix (requires NVLink)
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/planning pytest -q -s tests/test_planning.py
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/dispatch pytest -q -s tests/test_dispatch.py
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/combine pytest -q -s tests/test_combine.py
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/e2e pytest -q -s tests/test_e2e.py
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/grad_reduce pytest -q -s tests/test_grad_reduce.py
+python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs/prefetch pytest -q -s tests/test_prefetch.py
+
+# Four-rank planning boundary case skipped by the two-GPU run
+python -m paddle.distributed.launch --devices 0,1,2,3 --max_restart 0 --log_dir logs/planning-4gpu pytest -q -s 'tests/test_planning.py::test_planning_matches_reference_and_invariants[step1_segment_tail_full_tile]'
 ```
 
 ## Acknowledgments

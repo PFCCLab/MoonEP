@@ -19,6 +19,7 @@ survives a launch.
 """
 
 import os
+import random
 
 import pytest
 import torch
@@ -26,17 +27,18 @@ import torch.distributed as dist
 
 from moonep.buffer import create_nvl_single_owner_tensor, pad_dim0_for_alignment
 from moonep.prefetch import launch_prefetch
+from tests.kernel_test_utils import tensor_equal
+from tests.rng_utils import seeded_cuda_rng
 
 
 def _random_experts(E, B, seed):
     """Random plan with ~40% holes and possible duplicates. Local to each
     rank's launch, so it doesn't need to agree across ranks; seeding keeps
     failures reproducible."""
-    g = torch.Generator()
-    g.manual_seed(seed)
-    live = torch.rand(B, generator=g) < 0.6
-    ids = torch.randint(0, E, (B,), generator=g, dtype=torch.int32)
-    return torch.where(live, ids, torch.full_like(ids, -1)).tolist()
+    rng = random.Random(seed)
+    live = [rng.random() < 0.6 for _ in range(B)]
+    ids = [rng.randrange(E) for _ in range(B)]
+    return [expert if is_live else -1 for is_live, expert in zip(live, ids)]
 
 
 CASES = [
@@ -155,8 +157,8 @@ CASES = [
 
 @pytest.fixture(scope="module")
 def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("test_prefetch requires torchrun with at least 2 GPUs")
+    if "RANK" not in os.environ and "PADDLE_TRAINER_ID" not in os.environ:
+        pytest.skip("test_prefetch requires paddle.distributed.launch with at least 2 GPUs")
 
     owns_process_group = not dist.is_initialized()
     if owns_process_group:
@@ -171,7 +173,7 @@ def dist_env():
 
     yield rank, R
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier()
     if owns_process_group:
         dist.destroy_process_group()
 
@@ -189,15 +191,15 @@ def make_single_owner_experts(rank, R, E, H, Hp):
         )
         if rank == owner:
             seed = 2026 + owner + E * 13 + H * 17 + Hp * 19
-            gen = torch.Generator(device=f"cuda:{rank}").manual_seed(seed)
-            mapped[:E].copy_(
-                torch.randn(E, H, Hp, dtype=torch.bfloat16,
-                            device=f"cuda:{rank}", generator=gen)
-            )
+            dev = f"cuda:{rank}"
+            with seeded_cuda_rng(seed, dev):
+                mapped[:E].copy_(
+                    torch.randn(E, H, Hp, dtype=torch.bfloat16, device=dev)
+                )
             if padded_E > E:
                 mapped[E:].zero_()
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
         owners.append(mapped[:E])
     return owners
 
@@ -240,7 +242,7 @@ def run_case(rank, R, case):
     ok = True
     for b, e in enumerate(expert_ids):
         if e < 0:
-            if not torch.equal(
+            if not tensor_equal(
                 prefetch_buffers[b],
                 torch.full_like(prefetch_buffers[b], sentinel),
             ):
@@ -250,7 +252,7 @@ def run_case(rank, R, case):
                     f"buffer={b} was modified"
                 )
             continue
-        if not torch.equal(prefetch_buffers[b], remote_expert[e]):
+        if not tensor_equal(prefetch_buffers[b], remote_expert[e]):
             ok = False
             diff = (prefetch_buffers[b].float() - remote_expert[e].float()).abs().max().item()
             print(
@@ -268,7 +270,7 @@ def run_case(rank, R, case):
             f"H={H}, Hp={Hp}, num_sms={num_sms}"
         )
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier()
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])

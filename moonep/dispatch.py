@@ -825,8 +825,8 @@ def _check_dedup_builder_tensors(ctx: dict, dev: torch.device) -> None:
         t = ctx[name]
         assert t.dtype == torch.int32 and t.is_contiguous(), \
             f"{name} must be contiguous int32"
-        assert t.numel() == numel, \
-            f"{name} must have {numel} elements, got {t.numel()}"
+        assert t.shape.numel() == numel, \
+            f"{name} must have {numel} elements, got {t.shape.numel()}"
         assert t.device == dev, \
             f"{name} must be on {dev}, got {t.device}"
 
@@ -891,7 +891,7 @@ def launch_dispatch(
     assert ctx['meta_buf'].dtype == torch.int32 and ctx['meta_buf'].is_contiguous()
     assert ctx['meta_buf'].device == hidden_sh.device
     assert ctx['grid_sync_bar'].dtype == torch.int32 and ctx['grid_sync_bar'].is_contiguous()
-    assert ctx['grid_sync_bar'].numel() == 1
+    assert ctx['grid_sync_bar'].shape.numel() == 1
     assert ctx['grid_sync_bar'].device == hidden_sh.device
     if with_weights:
         assert route_weights_sk.dtype == torch.float32 and route_weights_sk.is_contiguous(), \

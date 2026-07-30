@@ -12,6 +12,10 @@ or, for a quick in-place build without installing:
 The .so lands at `moonep/_C.<abi-tag>.so`.
 """
 
+import paddle
+
+paddle.enable_compat()
+
 import os
 
 from setuptools import find_packages, setup
@@ -70,7 +74,7 @@ setup(
     version="0.0.1",
     packages=find_packages(include=["moonep", "moonep.*"]),
     install_requires=[
-        "nvidia-cutlass-dsl==4.4.2",
+        "nvidia-cutlass-dsl==4.4.1",
     ],
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

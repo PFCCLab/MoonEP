@@ -125,10 +125,17 @@ def assert_all_ranks(ok, rank, R, label, detail=""):
         raise AssertionError(f"{label} failed on another rank")
 
 
+def tensor_equal(actual, expected):
+    return (
+        tuple(actual.shape) == tuple(expected.shape)
+        and bool((actual == expected).all().item())
+    )
+
+
 def assert_tensor_equal_all_ranks(name, actual, expected, rank, R, max_print=5):
     actual_cpu = actual.cpu()
     expected_cpu = expected.cpu()
-    ok = torch.equal(actual_cpu, expected_cpu)
+    ok = tensor_equal(actual_cpu, expected_cpu)
     detail = ""
     if not ok:
         diff_mask = actual_cpu != expected_cpu
@@ -157,7 +164,7 @@ def clone_dedup_plan_fields(plan):
 
 
 def dedup_plan_fields_equal(plan, snapshot):
-    return all(torch.equal(getattr(plan, field), snapshot[field])
+    return all(tensor_equal(getattr(plan, field), snapshot[field])
                for field in DEDUP_PLAN_FIELDS)
 
 
@@ -361,7 +368,9 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
     else:
         dst_cpu = dst.cpu()
         raw_dst = torch.where(dst_cpu < 0, -dst_cpu - 1, dst_cpu)
-        dest_rank = torch.div(raw_dst, NvS, rounding_mode="floor")
+        dest_rank = torch.div(
+            raw_dst, torch.full_like(raw_dst, NvS), rounding_mode="floor"
+        )
         local_off = raw_dst % NvS
         if not torch.all((dest_rank >= 0) & (dest_rank < R)):
             errors.append("dst contains an out-of-range destination rank")

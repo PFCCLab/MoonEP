@@ -20,6 +20,7 @@ Coverage axes:
 """
 
 import os
+import random
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ import torch.distributed as dist
 from moonep import Buffer
 from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
 from moonep.grad_reduce import launch_grad_reduce
+from tests.rng_utils import seeded_cuda_rng
 
 
 # --------------------------------------------------------------------------
@@ -92,12 +94,14 @@ def _plan_asymmetric(R, B, epn, dev, seed=0):
 
 
 def _plan_random(R, B, epn, dev, seed=0):
-    g = torch.Generator()
-    g.manual_seed(seed)
-    live = torch.rand((R, B), generator=g) < 0.6
-    ids = torch.randint(0, R * epn, (R, B), generator=g, dtype=torch.int32)
-    plan = torch.where(live, ids, torch.full_like(ids, -1))
-    return plan.to(dev)
+    rng = random.Random(seed)
+    live = [[rng.random() < 0.6 for _ in range(B)] for _ in range(R)]
+    ids = [[rng.randrange(R * epn) for _ in range(B)] for _ in range(R)]
+    plan = [
+        [ids[r][b] if live[r][b] else -1 for b in range(B)]
+        for r in range(R)
+    ]
+    return torch.tensor(plan, dtype=torch.int32).to(dev)
 
 
 PLAN_BUILDERS = {
@@ -133,9 +137,8 @@ def _slot_values(rank, B, H, Hp, dev):
 
 
 def _randn(shape, seed, dev):
-    g = torch.Generator(device=dev)
-    g.manual_seed(seed)
-    return torch.randn(shape, generator=g, device=dev, dtype=torch.float32)
+    with seeded_cuda_rng(seed, dev):
+        return torch.randn(shape, device=dev, dtype=torch.float32)
 
 
 def _make_data_fns(mode, rank, R, E, B, H, Hp, dev, seed):
@@ -177,6 +180,16 @@ def _assert_all_ranks(ok, rank, label):
     assert int(ok_tensor.item()) == 1, label
 
 
+def _tensor_equal(actual, expected):
+    # TODO(Paddle compat): use torch.equal directly once its proxy returns a
+    # Python bool instead of an elementwise bool tensor.
+    return (
+        actual.shape == expected.shape
+        and actual.dtype == expected.dtype
+        and bool((actual == expected).all().item())
+    )
+
+
 def _verify(rank, R, E, B, plan, grads_fn, slot_fn,
             remote_expert_grads, reduce_buffers, label):
     epn = E // R
@@ -192,12 +205,12 @@ def _verify(rank, R, E, B, plan, grads_fn, slot_fn,
     # order; the randn cases round and so genuinely pin that order. Loosen
     # to allclose if the kernel ever reorders accumulation (atomics,
     # multi-CTA slot splits, ...).
-    ok_grads = torch.equal(actual_local, expected_local)
+    ok_grads = _tensor_equal(actual_local, expected_local)
 
     pristine = grads_fn()
-    ok_nonlocal = torch.equal(
+    ok_nonlocal = _tensor_equal(
         remote_expert_grads[:local_start], pristine[:local_start]
-    ) and torch.equal(remote_expert_grads[local_end:], pristine[local_end:])
+    ) and _tensor_equal(remote_expert_grads[local_end:], pristine[local_end:])
 
     zero_ok = True
     unchanged_ok = True
@@ -206,13 +219,15 @@ def _verify(rank, R, E, B, plan, grads_fn, slot_fn,
         for b in range(B):
             expert = int(plan_cpu[src, b])
             if expert >= 0:
-                if not torch.equal(reduce_buffers[src, b],
-                                   torch.zeros_like(reduce_buffers[src, b])):
+                if not _tensor_equal(
+                    reduce_buffers[src, b],
+                    torch.zeros_like(reduce_buffers[src, b]),
+                ):
                     zero_ok = False
             else:
                 if slot_vals is None:
                     slot_vals = slot_fn(src)
-                if not torch.equal(reduce_buffers[src, b], slot_vals[b]):
+                if not _tensor_equal(reduce_buffers[src, b], slot_vals[b]):
                     unchanged_ok = False
 
     ok = bool(ok_grads and ok_nonlocal and zero_ok and unchanged_ok)
@@ -351,8 +366,11 @@ CASES = [
 
 @pytest.fixture(scope="module")
 def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("test_grad_reduce requires torchrun with at least 2 GPUs")
+    if "RANK" not in os.environ and "PADDLE_TRAINER_ID" not in os.environ:
+        pytest.skip(
+            "test_grad_reduce requires torchrun or paddle.distributed.launch "
+            "with at least 2 GPUs"
+        )
 
     owns_process_group = not dist.is_initialized()
     if owns_process_group:
@@ -367,7 +385,7 @@ def dist_env():
 
     yield rank, R
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier()
     if owns_process_group:
         dist.destroy_process_group()
 
@@ -398,7 +416,7 @@ def run_case(rank, R, case):
         remote_expert_grads = grads_fn().contiguous()
         reduce_buffers[rank].copy_(slot_fn(rank))
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
 
         launch_grad_reduce(
             remote_expert_grads,
@@ -412,7 +430,7 @@ def run_case(rank, R, case):
             grid_sync_bar=ctx['grid_sync_bar'],
         )
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
 
         _verify(rank, R, E, B, plan, grads_fn, slot_fn,
                 remote_expert_grads, reduce_buffers,
@@ -424,7 +442,7 @@ def run_case(rank, R, case):
                 f"H={H}, Hp={Hp}, num_sms={num_sms}"
             )
 
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
     finally:
         buffer.destroy()
 
@@ -468,7 +486,7 @@ def test_grad_reduce_repeated_launch(dist_env):
             remote_expert_grads = grads_fn()
             reduce_buffers[rank].copy_(slot_fn(rank))
             torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            dist.barrier()
 
             launch_grad_reduce(
                 remote_expert_grads,
@@ -482,7 +500,7 @@ def test_grad_reduce_repeated_launch(dist_env):
                 grid_sync_bar=ctx['grid_sync_bar'],
             )
             torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            dist.barrier()
 
             _verify(rank, R, E, B, plan, grads_fn, slot_fn,
                     remote_expert_grads, reduce_buffers,
@@ -490,7 +508,7 @@ def test_grad_reduce_repeated_launch(dist_env):
 
         if rank == 0:
             print(f"  [PASS] repeated_launch: R={R}, rounds={len(rounds)}")
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
     finally:
         buffer.destroy()
 

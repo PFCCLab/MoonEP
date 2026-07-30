@@ -17,6 +17,7 @@ from tests.kernel_test_utils import (
     init_case,
     make_topk,
 )
+from tests.rng_utils import seeded_cuda_rng
 
 
 COMBINE_CASES = [
@@ -84,9 +85,9 @@ LARGE_COMBINE_CASES = [
 
 def _random_inputs(case, rank, R, seed=0):
     dev = f"cuda:{rank}"
-    gen = torch.Generator(device=dev).manual_seed(seed + rank)
-    hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device=dev, generator=gen)
-    weights = torch.rand(case.S, case.K, dtype=torch.float32, device=dev, generator=gen)
+    with seeded_cuda_rng(seed + rank, dev):
+        hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device=dev)
+        weights = torch.rand(case.S, case.K, dtype=torch.float32, device=dev)
     topk, tpe = make_topk(case, rank, R)
     return hidden, weights, topk, tpe
 
@@ -157,7 +158,7 @@ def _expert_ids_from_experts_to_copy(ctx, cu_seqlens, experts_to_copy_row):
 
 def _uniform_scale(buf, cu_seqlens, expert_ids):
     total = int(cu_seqlens[-1].item())
-    buf[:total].mul_(3.0)
+    buf[:total] = buf[:total] * 3.0
 
 
 def _per_expert_scale(buf, cu_seqlens, expert_ids):
@@ -167,7 +168,7 @@ def _per_expert_scale(buf, cu_seqlens, expert_ids):
         if cur > prev:
             expert_id = int(expert_ids[group_id].item())
             if expert_id >= 0:
-                buf[prev:cur].mul_(float(expert_id + 1))
+                buf[prev:cur] = buf[prev:cur] * float(expert_id + 1)
         prev = cur
 
 
@@ -324,7 +325,7 @@ def test_buffer_combine_async_gathers_weights(dist_env):
         route_weights_nvs=weights_user,
         async_finish=True,
     )
-    event.wait(torch.cuda.current_stream())
+    torch.cuda.current_stream().wait_event(event)
     torch.cuda.synchronize()
 
     assert_tensor_equal_all_ranks("async combine hidden", out, ref_out, rank, R)

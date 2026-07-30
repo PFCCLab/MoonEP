@@ -17,7 +17,9 @@ from tests.kernel_test_utils import (
     clone_dedup_plan_fields,
     dedup_plan_fields_equal,
     dedup_plan_semantic_errors,
+    tensor_equal,
 )
+from tests.rng_utils import seeded_cuda_rng
 
 
 def setup():
@@ -29,10 +31,10 @@ def setup():
 
 def make_inputs(rank, S, H, K, E, seed=0):
     dev = f"cuda:{rank}"
-    g = torch.Generator(device=dev).manual_seed(seed + rank)
-    hidden = torch.randn(S, H, dtype=torch.bfloat16, device=dev, generator=g)
-    weights = torch.rand(S, K, dtype=torch.float32, device=dev, generator=g)
-    topk = torch.randint(0, E, (S, K), dtype=torch.int32, device=dev, generator=g)
+    with seeded_cuda_rng(seed + rank, dev):
+        hidden = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
+        weights = torch.rand(S, K, dtype=torch.float32, device=dev)
+        topk = torch.randint(0, E, (S, K), dtype=torch.int32, device=dev)
     tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
     return hidden, weights, topk, tpe
 
@@ -49,14 +51,14 @@ def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
             local_rank=rank,
         )
         if rank == owner:
-            g = torch.Generator(device=dev).manual_seed(5000 + owner)
-            mapped[:E].copy_(
-                torch.randn(E, H, Hp, dtype=torch.bfloat16, device=dev, generator=g)
-            )
+            with seeded_cuda_rng(5000 + owner, dev):
+                mapped[:E].copy_(
+                    torch.randn(E, H, Hp, dtype=torch.bfloat16, device=dev)
+                )
             if padded_E > E:
                 mapped[E:].zero_()
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier()
         owners.append(mapped[:E])
 
     remote_owner = (rank + owner_offset) % R
@@ -71,7 +73,7 @@ def make_full_weight(rank, remote_expert, B, source_offset):
     full_weight = torch.empty(E + B, H, Hp, dtype=torch.bfloat16, device=dev)
     full_weight[:E].copy_(remote_expert)
     if source_offset:
-        full_weight[:E].add_(source_offset)
+        full_weight[:E] = full_weight[:E] + source_offset
     if B:
         full_weight[E:].zero_()
     return full_weight
@@ -94,7 +96,7 @@ def assert_prefetched(prefetch_args, experts_to_copy):
             continue
         for name, full_weight in prefetch_args.items():
             E = full_weight.shape[0] - B
-            assert torch.equal(full_weight[E + b], full_weight[expert]), (
+            assert tensor_equal(full_weight[E + b], full_weight[expert]), (
                 f"{name} prefetch buffer {b} does not match expert {expert}"
             )
 
@@ -107,7 +109,7 @@ def fill_prefetch_slots(prefetch_args, B, value):
 def assert_prefetch_slots_equal(prefetch_args, B, value):
     for name, full_weight in prefetch_args.items():
         expected = torch.full_like(full_weight[-B:], value)
-        assert torch.equal(full_weight[-B:], expected), (
+        assert tensor_equal(full_weight[-B:], expected), (
             f"{name} prefetch slots changed without prefetch_weight"
         )
 
@@ -174,11 +176,11 @@ def assert_grad_reduced(rank, R, E, H, Hp, experts_to_copy, args, offsets):
         assert torch.allclose(
             full_grad[local_start:local_end], expected, rtol=0.0, atol=1e-5
         ), f"{name} local grad reduce mismatch"
-        assert torch.equal(
+        assert tensor_equal(
             full_grad[:local_start],
             grad_base(E, H, Hp, full_offset, full_grad.device)[:local_start],
         ), f"{name} non-local prefix grad changed"
-        assert torch.equal(
+        assert tensor_equal(
             full_grad[local_end:],
             grad_base(E + experts_to_copy.shape[1], H, Hp, full_offset, full_grad.device)[local_end:],
         ), f"{name} non-local suffix grad changed"
@@ -190,12 +192,12 @@ def assert_grad_reduced(rank, R, E, H, Hp, experts_to_copy, args, offsets):
             for b in range(experts_to_copy.shape[1]):
                 expert = int(experts_to_copy[src_rank, b].item())
                 if expert >= 0 and src_rank == rank:
-                    assert torch.equal(
+                    assert tensor_equal(
                         reduce_buffer[src_rank, b],
                         torch.zeros_like(reduce_buffer[src_rank, b]),
                     ), f"{name} consumed reduce slot ({src_rank}, {b}) was not cleared"
                 else:
-                    assert torch.equal(
+                    assert tensor_equal(
                         reduce_buffer[src_rank, b],
                         original_reduce[src_rank, b],
                     ), f"{name} non-local reduce slot ({src_rank}, {b}) changed"
@@ -243,8 +245,8 @@ def test_e2e():
 
     # --- Async variant (fresh inputs to avoid NVL aliasing with sync run) ---
     hidden2, weights2, topk2, tpe2 = make_inputs(rank, S, H, K, E)
-    assert torch.equal(hidden, hidden2)
-    assert torch.equal(weights, weights2)
+    assert tensor_equal(hidden, hidden2)
+    assert tensor_equal(weights, weights2)
 
     (h_a, w_a, cu_a, plan_a, _dispatch_event) = buffer.dispatch(
         hidden2, weights2, topk2, tpe2, async_finish=True,
@@ -253,18 +255,18 @@ def test_e2e():
         plan=plan_a, async_finish=True, **async_prefetch_args,
     )
     # Caller must explicitly wait before reading.
-    prefetch_event.wait(torch.cuda.current_stream())
+    torch.cuda.current_stream().wait_event(prefetch_event)
     h_a_snap = h_a.clone()
     w_a_snap = w_a.clone() if w_a is not None else None
     torch.cuda.synchronize()
     assert_prefetched(async_prefetch_args, plan_a.experts_to_copy[rank])
 
     # Compare
-    assert torch.equal(h_sync_cpu, h_a_snap), "dispatch hidden mismatch"
-    assert torch.equal(w_sync_cpu, w_a_snap), "dispatch weights mismatch"
-    assert torch.equal(cu_sync_cpu, cu_a), "cu_seqlens mismatch"
+    assert tensor_equal(h_sync_cpu, h_a_snap), "dispatch hidden mismatch"
+    assert tensor_equal(w_sync_cpu, w_a_snap), "dispatch weights mismatch"
+    assert tensor_equal(cu_sync_cpu, cu_a), "cu_seqlens mismatch"
     for name in ("dst", "experts_to_copy", "zero_fill_ranges", "remote_stats"):
-        assert torch.equal(getattr(plan_snapshot, name), getattr(plan_a, name)), \
+        assert tensor_equal(getattr(plan_snapshot, name), getattr(plan_a, name)), \
             f"plan.{name} mismatch"
     assert_dedup_plan_semantic_equal(plan_a, plan_snapshot)
 
@@ -276,7 +278,7 @@ def test_e2e():
     )
     buffer.prefetch_weight(plan=plan_snapshot, **reuse_prefetch_args)
     torch.cuda.synchronize()
-    assert torch.equal(h_reuse.clone(), h_sync_cpu), "plan-reuse hidden buffer mismatch"
+    assert tensor_equal(h_reuse.clone(), h_sync_cpu), "plan-reuse hidden buffer mismatch"
     assert w_reuse is None, "plan-reuse hidden-only dispatch should not return weights buffer"
     assert cu_reuse is None, "plan-reuse path should skip planning outputs"
     assert plan_reuse is plan_snapshot, "plan-reuse should echo the input plan back"
@@ -293,7 +295,7 @@ def test_e2e():
         hidden, plan=plan_snapshot,
     )
     torch.cuda.synchronize()
-    assert torch.equal(h_no_prefetch.clone(), h_sync_cpu), "no-prefetch hidden buffer mismatch"
+    assert tensor_equal(h_no_prefetch.clone(), h_sync_cpu), "no-prefetch hidden buffer mismatch"
     assert w_no_prefetch is None, "no-prefetch hidden-only dispatch should not return weights buffer"
     assert cu_no_prefetch is None, "no-prefetch plan-reuse path should skip planning outputs"
     assert dedup_plan_fields_equal(plan_snapshot, no_prefetch_dedup_before), \
@@ -305,14 +307,14 @@ def test_e2e():
         hidden, plan=plan_snapshot,
     )
     torch.cuda.synchronize()
-    assert torch.equal(h_no_weights.clone(), h_sync_cpu), "dispatch without weights hidden mismatch"
+    assert tensor_equal(h_no_weights.clone(), h_sync_cpu), "dispatch without weights hidden mismatch"
 
     (h_no_prefetch_async, _, _, _, ev_no_prefetch) = buffer.dispatch(
         hidden, plan=plan_snapshot, async_finish=True,
     )
-    ev_no_prefetch.wait(torch.cuda.current_stream())
+    torch.cuda.current_stream().wait_event(ev_no_prefetch)
     torch.cuda.synchronize()
-    assert torch.equal(
+    assert tensor_equal(
         h_no_prefetch_async.clone(), h_sync_cpu
     ), "async no-prefetch hidden mismatch"
 
@@ -336,8 +338,8 @@ def test_e2e():
         route_weights_nvs=w_for_combine,
     )
     torch.cuda.synchronize()
-    assert torch.equal(out_sync_snap, out_with_weights), "combine weight-gather hidden mismatch"
-    assert torch.equal(gathered_weights, weights), "combine route_weights_sk gather mismatch"
+    assert tensor_equal(out_sync_snap, out_with_weights), "combine weight-gather hidden mismatch"
+    assert tensor_equal(gathered_weights, weights), "combine route_weights_sk gather mismatch"
 
     # --- zero_copy round-trip: dispatch returns NVL views, the "FFN" is an
     # identity on the shard, combine consumes the views in place. Must match
@@ -347,9 +349,9 @@ def test_e2e():
     )
     assert h_zc.data_ptr() == buffer._require_ctx()['hidden_buf_local'].data_ptr(), \
         "dispatch(zero_copy=True) must return the NVL shard view"
-    assert torch.equal(h_zc, h_for_combine), \
+    assert tensor_equal(h_zc, h_for_combine), \
         "zero_copy dispatch hidden view mismatch vs copied tensor"
-    assert torch.equal(w_zc, w_for_combine), \
+    assert tensor_equal(w_zc, w_for_combine), \
         "zero_copy dispatch weights view mismatch vs copied tensor"
     out_zc, gathered_weights_zc, _ = buffer.combine(
         plan=plan_zc,
@@ -358,8 +360,8 @@ def test_e2e():
         zero_copy=True,
     )
     torch.cuda.synchronize()
-    assert torch.equal(out_sync_snap, out_zc), "zero_copy combine hidden mismatch"
-    assert torch.equal(gathered_weights_zc, weights), \
+    assert tensor_equal(out_sync_snap, out_zc), "zero_copy combine hidden mismatch"
+    assert tensor_equal(gathered_weights_zc, weights), \
         "zero_copy combine route_weights_sk gather mismatch"
     assert_raises_assertion(
         "alias",
@@ -382,7 +384,7 @@ def test_e2e():
     )
     buffer.reduce_grad(plan=plan_snapshot, **grad_args)
     torch.cuda.synchronize()
-    assert torch.equal(out_sync_snap, out_grad_sync), "sync grad_reduce combine output mismatch"
+    assert tensor_equal(out_sync_snap, out_grad_sync), "sync grad_reduce combine output mismatch"
     assert_grad_reduced(rank, R, E, H, Hp, plan_snapshot.experts_to_copy, grad_args, grad_offsets)
 
     # Re-run dispatch to re-populate NVL for async combine
@@ -401,10 +403,10 @@ def test_e2e():
         async_finish=True,
         **async_grad_args,
     )
-    reduce_ev.wait(torch.cuda.current_stream())
+    torch.cuda.current_stream().wait_event(reduce_ev)
     torch.cuda.synchronize()
 
-    assert torch.equal(out_sync_snap, out_async), "combine output mismatch"
+    assert tensor_equal(out_sync_snap, out_async), "combine output mismatch"
     assert_grad_reduced(
         rank, R, E, H, Hp, plan_snapshot.experts_to_copy, async_grad_args, async_grad_offsets
     )

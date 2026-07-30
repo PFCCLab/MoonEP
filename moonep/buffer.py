@@ -219,7 +219,7 @@ def _create_nvl_multicast_view(
     single chunk (write `mc[off]` hits every rank's chunk `[off]`).
     """
     assert nvl_multicast_supported(), "Multicast not supported on this device"
-    chunk_elems = meta_buf.numel() // world_size
+    chunk_elems = meta_buf.shape.numel() // world_size
     size_bytes = chunk_elems * meta_buf.element_size()
     is_root = local_rank == 0
 

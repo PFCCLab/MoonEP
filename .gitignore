@@ -5,3 +5,6 @@ __pycache__/
 *.ncu-rep
 *.nsys-rep
 build/**
+_C.py
+.ninja_log
+logs/

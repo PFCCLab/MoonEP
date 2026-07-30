@@ -1,8 +1,13 @@
 import os
 
+import paddle
+
+paddle.enable_compat(scope={"moonep", "tests"})
+
 import pytest
-import torch
-import torch.distributed as dist
+
+import moonep  # noqa: F401
+import paddle.distributed as dist
 
 
 @pytest.fixture(autouse=True)
@@ -15,16 +20,19 @@ def cleanup_moonep_buffers():
 
 @pytest.fixture(scope="session")
 def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("distributed kernel tests must be launched with torchrun")
+    if "RANK" not in os.environ and "PADDLE_TRAINER_ID" not in os.environ:
+        pytest.skip(
+            "distributed kernel tests must be launched with torchrun "
+            "or paddle.distributed.launch"
+        )
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    paddle.cuda.set_device(rank)
 
     yield rank, dist.get_world_size()
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier()
     if dist.is_initialized():
         dist.destroy_process_group()

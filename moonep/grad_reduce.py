@@ -229,12 +229,18 @@ class GradReduceKernel:
         for i in cutlass.range(tidx, R * B, self.NUM_THREADS, unroll=1):
             e = sexp[i]
             if e >= Int32(0) and e < Int32(EPN):
-                cute.arch.atomic_add(off.iterator + (e + Int32(1)), Int32(1),
-                                     scope="cta")
+                # cute.arch.atomic_add(off.iterator + (e + Int32(1)), Int32(1),
+                #                      scope="cta")
+                cute.arch.atomic_add(
+                    (off.iterator + (e + Int32(1))).llvm_ptr,
+                    Int32(1),
+                    scope="cta",
+                )
         # this rank's own consumed slots (experts[rank,b] >= 0), unordered.
         for b in cutlass.range(tidx, B, self.NUM_THREADS, unroll=1):
             if sexp[rank * B + b] >= Int32(0) - rank_epn:
-                pos = cute.arch.atomic_add(ccnt.iterator, Int32(1), scope="cta")
+                # pos = cute.arch.atomic_add(ccnt.iterator, Int32(1), scope="cta")
+                pos = cute.arch.atomic_add(ccnt.iterator.llvm_ptr, Int32(1), scope="cta")
                 clist[pos] = Int32(b)
         cute.arch.sync_threads()
         # serial prefix + active-expert compaction over EPN (smem-only).
@@ -266,11 +272,13 @@ class GradReduceKernel:
                         e = ee
                 peers = match_any_b32(e)
                 cell = cur.iterator + e
-                base = cute.arch.load(cell, Int32)
+                # base = cute.arch.load(cell, Int32)
+                base = cute.arch.load(cell.llvm_ptr, Int32)
                 pos = base + Int32(cute.arch.popc(peers & lanes_lt))
                 cute.arch.sync_warp()
                 if (peers & lanes_lt) == Uint32(0):
-                    cute.arch.store(cell, base + Int32(cute.arch.popc(peers)))
+                    # cute.arch.store(cell, base + Int32(cute.arch.popc(peers)))
+                    cute.arch.store(cell.llvm_ptr, base + Int32(cute.arch.popc(peers)))
                 cute.arch.sync_warp()
                 if e < Int32(EPN):
                     slist[pos] = Int32(rb)
@@ -468,7 +476,7 @@ def launch_grad_reduce(
     The caller must ensure all ranks have finished writing
     ``remote_reduce_buffers`` before launching this kernel on any rank.
     """
-    if remote_reduce_buffers.numel() == 0 or experts_to_copy.numel() == 0:
+    if remote_reduce_buffers.shape.numel() == 0 or experts_to_copy.shape.numel() == 0:
         return
 
     assert remote_expert_grads.dtype == torch.float32 and remote_expert_grads.is_contiguous(), \

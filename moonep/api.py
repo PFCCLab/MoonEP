@@ -104,7 +104,7 @@ def _num_sms_dedup_from_env(max_sms: int) -> int:
 
 def _log_context_buffer_size(ctx: dict) -> None:
     def tensor_nbytes(tensor: torch.Tensor) -> int:
-        return int(tensor.numel()) * int(tensor.element_size())
+        return int(tensor.shape.numel()) * int(tensor.element_size())
 
     def format_nbytes(nbytes: int) -> str:
         if nbytes >= 1 << 30:
@@ -569,9 +569,11 @@ class Buffer:
 
     @staticmethod
     def _record_streams(tensors, stream: torch.cuda.Stream) -> None:
-        for t in tensors:
-            if t is not None:
-                t.record_stream(stream)
+        # Paddle's _record_stream() records the current stream.
+        with torch.cuda.stream(stream):
+            for t in tensors:
+                if t is not None:
+                    t._record_stream()
 
     @staticmethod
     def _plan_runtime_tensors(plan: MoonEPCommPlan):
@@ -742,9 +744,9 @@ class Buffer:
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
             topk_flat = topk_experts_sk.reshape(-1)
-            assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
+            assert topk_flat.dtype == torch.int32 and topk_flat.shape.numel() == int(ctx['N'])
             assert tokens_per_expert.dtype == torch.int32
-            assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
+            assert tokens_per_expert.shape.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
             plan, cu_seqlens = allocate_planning_outputs(ctx)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
