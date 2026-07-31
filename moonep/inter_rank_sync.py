@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import make_ptr
 
-from moonep._common import cross_rank_barrier
+from moonep._common import cross_rank_barrier, current_cuda_stream_handle
 
 
 class InterRankSyncKernel:
@@ -144,7 +144,7 @@ def launch_inter_rank_sync(ctx: dict) -> None:
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     compiled(
         meta_ptr,

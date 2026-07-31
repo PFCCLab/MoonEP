@@ -16,11 +16,23 @@ Note: cp.async.bulk is a single-thread instruction; callers must wrap the
 inline asm in ``if cute.arch.lane_idx() == 0:``.
 """
 
+import torch
+
 import cutlass
 from cutlass import Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 import cutlass.cute as cute
+
+
+def current_cuda_stream_handle() -> int:
+    stream = torch.cuda.current_stream()
+    handle = getattr(stream, "cuda_stream", None)
+    if handle is not None:
+        return handle
+    # TODO(Paddle compat): remove this fallback once the proxy exposes the
+    # public PyTorch Stream.cuda_stream property.
+    return stream.__cuda_stream__()[1]
 
 
 # ============================================================================

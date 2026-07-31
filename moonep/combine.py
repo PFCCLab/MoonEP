@@ -29,6 +29,7 @@ from moonep._common import (
     cp_async_bulk_g2s as _cp_async_bulk_g2s,
     cp_async_bulk_s2g as _cp_async_bulk_s2g,
     cross_rank_barrier,
+    current_cuda_stream_handle,
     pdl_wait_predecessor,
 )
 
@@ -638,7 +639,7 @@ def launch_combine(
     bar_ptr = make_ptr(Int32, ctx['grid_sync_bar'].data_ptr(),
                        cute.AddressSpace.gmem, assumed_align=16)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     compiled(
         out_ptr,

@@ -10,6 +10,20 @@ import moonep  # noqa: F401
 import paddle.distributed as dist
 
 
+def _local_rank():
+    for name in (
+        "LOCAL_RANK",
+        "PADDLE_LOCAL_RANK",
+        "PADDLE_RANK_IN_NODE",
+        "RANK",
+        "PADDLE_TRAINER_ID",
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            return int(value)
+    raise RuntimeError("distributed launcher did not set a rank environment variable")
+
+
 @pytest.fixture(autouse=True)
 def cleanup_moonep_buffers():
     yield
@@ -26,10 +40,13 @@ def dist_env():
             "or paddle.distributed.launch"
         )
 
+    local_rank = _local_rank()
+    paddle.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        # TODO(Paddle compat): use init_process_group once the
+        # torch.distributed proxy provides it.
+        dist.init_parallel_env()
     rank = dist.get_rank()
-    paddle.cuda.set_device(rank)
 
     yield rank, dist.get_world_size()
 

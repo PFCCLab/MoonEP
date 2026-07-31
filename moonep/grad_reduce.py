@@ -39,7 +39,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_ptr
 
-from moonep._common import cross_rank_barrier
+from moonep._common import cross_rank_barrier, current_cuda_stream_handle
 from moonep.planning import match_any_b32, st_global_v4_s32
 
 
@@ -541,7 +541,7 @@ def launch_grad_reduce(
     bar_ptr = make_ptr(
         Int32, grid_sync_bar.data_ptr(), cute.AddressSpace.gmem, assumed_align=16,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     compiled(grad_ptr, reduce_ptr, experts_ptr, meta_ptr, bar_ptr,
              Int32(int(rank)), Int32(int(barrier_off)), stream)

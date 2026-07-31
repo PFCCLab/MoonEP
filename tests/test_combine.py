@@ -6,6 +6,7 @@ Run with:
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from tests.kernel_test_utils import (
     KernelCase,
@@ -284,6 +285,8 @@ def test_buffer_combine_stages_external_buffers_and_gathers_weights(dist_env):
     )
 
     ref_out, ref_weights = _combine_full(ctx, case, plan, hidden_user, weights_user)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     staged_hidden = hidden_user.clone()
     staged_weights = weights_user.clone()

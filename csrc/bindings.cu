@@ -4,7 +4,9 @@
 /**
  * Return the VMM allocation granularity in bytes for the current device.
  */
-int64_t get_vmm_granularity() {
+int64_t get_vmm_granularity_for_handle_type(
+    CUmemAllocationHandleType handle_type
+) {
     int device_id;
     CUDACHECK(cudaGetDevice(&device_id));
 
@@ -15,12 +17,21 @@ int64_t get_vmm_granularity() {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = device_id;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.requestedHandleTypes = handle_type;
 
     size_t granularity;
     CUCHECK(cuMemGetAllocationGranularity(
         &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
     return static_cast<int64_t>(granularity);
+}
+
+int64_t get_vmm_granularity() {
+    return get_vmm_granularity_for_handle_type(
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+}
+
+int64_t get_vmm_granularity_fabric() {
+    return get_vmm_granularity_for_handle_type(CU_MEM_HANDLE_TYPE_FABRIC);
 }
 
 PYBIND11_MODULE(_C, m) {
@@ -32,11 +43,27 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("fds"), pybind11::arg("local_rank"),
           pybind11::arg("world_size"),
           "Map all chunk fds into a contiguous VA region (all RW).");
+    m.def("nvl_dist_alloc_fabric", &nvl_dist_alloc_fabric,
+          pybind11::arg("shape"), pybind11::arg("dtype"),
+          "Allocate a local chunk and export an MNNVL fabric handle.");
+    m.def("nvl_dist_map_fabric", &nvl_dist_map_fabric,
+          pybind11::arg("chunk_shape"), pybind11::arg("dtype"),
+          pybind11::arg("fabric_handles"), pybind11::arg("local_rank"),
+          pybind11::arg("world_size"),
+          "Map fabric-backed chunks into a contiguous VA region (all RW).");
     m.def("get_vmm_granularity", &get_vmm_granularity,
           "Return VMM allocation granularity in bytes.");
+    m.def("get_vmm_granularity_fabric", &get_vmm_granularity_fabric,
+          "Return fabric VMM allocation granularity in bytes.");
     m.def("get_multicast_granularity", &get_multicast_granularity,
           pybind11::arg("num_devices"),
           "Return multicast recommended allocation granularity in bytes.");
+    m.def("get_multicast_granularity_fabric",
+          &get_multicast_granularity_fabric,
+          pybind11::arg("num_devices"),
+          "Return fabric multicast allocation granularity in bytes.");
+    m.def("nvl_fabric_supported", &nvl_fabric_supported,
+          "Whether fabric allocation is usable through the current IMEX channel.");
     m.def("nvl_multicast_supported", &nvl_multicast_supported,
           "Whether the current device supports multicast (NVSwitch SHARP).");
     m.def("nvl_multicast_create", &nvl_multicast_create,
@@ -45,6 +72,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("nvl_multicast_import", &nvl_multicast_import,
           pybind11::arg("fd"),
           "Non-root: import a multicast object from the root's POSIX fd.");
+    m.def("nvl_multicast_create_fabric", &nvl_multicast_create_fabric,
+          pybind11::arg("size_bytes"), pybind11::arg("num_devices"),
+          "Root-only: create a multicast object and export a fabric handle.");
+    m.def("nvl_multicast_import_fabric", &nvl_multicast_import_fabric,
+          pybind11::arg("fabric_handle"),
+          "Non-root: import a multicast object from a fabric handle.");
     m.def("nvl_multicast_add_device", &nvl_multicast_add_device,
           pybind11::arg("mc_handle"),
           "Add the current device to a multicast object (before bind).");
@@ -54,6 +87,10 @@ PYBIND11_MODULE(_C, m) {
           "Bind the local chunk's owned physical memory (nvl_dist_alloc handle) "
           "to the multicast object and map a multicast VA; returns a keepalive "
           "int32 tensor whose data_ptr is the multimem address.");
+    m.def("nvl_multicast_bind_map_fabric", &nvl_multicast_bind_map_fabric,
+          pybind11::arg("mc_handle"), pybind11::arg("owned_mem_handle"),
+          pybind11::arg("size_bytes"), pybind11::arg("num_devices"),
+          "Bind fabric allocation memory to a fabric multicast object.");
     m.def("nvl_release_mem_handle", &nvl_release_mem_handle,
           pybind11::arg("mem_handle"),
           "Release an owned mem handle returned by nvl_dist_alloc.");

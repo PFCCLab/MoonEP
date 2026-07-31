@@ -30,7 +30,11 @@ import cutlass.utils as utils
 from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass.cute.runtime import make_ptr
 
-from moonep._common import cp_async_bulk_g2s, pdl_trigger_dependents
+from moonep._common import (
+    cp_async_bulk_g2s,
+    current_cuda_stream_handle,
+    pdl_trigger_dependents,
+)
 from moonep.planning import MoonEPCommPlan
 
 
@@ -589,7 +593,7 @@ def launch_combine_prologue(
     dup_counts_ptr = make_ptr(Int32, plan.dup_counts.data_ptr(),
                               cute.AddressSpace.gmem, assumed_align=8)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     prologue_compiled(
         hbf_local_ptr,

@@ -232,6 +232,26 @@ python -m paddle.distributed.launch --devices 0,1 --max_restart 0 --log_dir logs
 python -m paddle.distributed.launch --devices 0,1,2,3 --max_restart 0 --log_dir logs/planning-4gpu pytest -q -s 'tests/test_planning.py::test_planning_matches_reference_and_invariants[step1_segment_tail_full_tile]'
 ```
 
+### MNNVL Support
+
+MNNVL mode replaces only the VMM handle transport with CUDA fabric handles;
+the kernels and buffer layout are unchanged. It is opt-in, so the existing
+POSIX-fd path remains the default. All ranks must set the variable consistently,
+and the container must expose a working IMEX channel.
+
+```bash
+export MOONEP_USE_MNNVL=1
+
+# Checks both the fabric device attribute and an actual fabric allocation.
+python -c "import paddle; paddle.enable_compat(scope={'moonep'}); from moonep.buffer import mnnvl_available; print(mnnvl_available())"
+
+# Focused fabric unicast + multicast test.
+python -m paddle.distributed.launch --devices 0,1,2,3 --max_restart 0 --log_dir logs/mnnvl pytest -q -s tests/test_mnnvl.py
+
+# Multi-node: run on every node with its zero-based NODE_RANK and local NODE_IP.
+python -m paddle.distributed.launch --master "$MASTER_ADDR:$MASTER_PORT" --nnodes 2 --rank "$NODE_RANK" --host "$NODE_IP" --devices 0,1,2,3 --nproc_per_node 4 --max_restart 0 --log_dir "logs/mnnvl-node-$NODE_RANK" pytest -q -s tests/test_mnnvl.py
+```
+
 ## Acknowledgments
 
 This library is inspired by the following works:

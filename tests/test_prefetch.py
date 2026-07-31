@@ -21,9 +21,9 @@ survives a launch.
 import os
 import random
 
+import paddle.distributed as dist
 import pytest
 import torch
-import torch.distributed as dist
 
 from moonep.buffer import create_nvl_single_owner_tensor, pad_dim0_for_alignment
 from moonep.prefetch import launch_prefetch
@@ -162,7 +162,9 @@ def dist_env():
 
     owns_process_group = not dist.is_initialized()
     if owns_process_group:
-        dist.init_process_group(backend="nccl")
+        # TODO(Paddle compat): use init_process_group once the
+        # torch.distributed proxy provides it.
+        dist.init_parallel_env()
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
     R = dist.get_world_size()

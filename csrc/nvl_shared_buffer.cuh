@@ -45,9 +45,10 @@
 } while(0)
 #endif
 
-static inline std::tuple<size_t, size_t, int> nvl_prepare(
+static inline std::tuple<size_t, size_t, int> nvl_prepare_for_handle_type(
     const std::vector<int64_t> &shape,
-    at::ScalarType dtype
+    at::ScalarType dtype,
+    CUmemAllocationHandleType handle_type
 ) {
     TORCH_CHECK(!shape.empty(), "Shape must be non-empty");
 
@@ -64,7 +65,7 @@ static inline std::tuple<size_t, size_t, int> nvl_prepare(
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = device_id;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.requestedHandleTypes = handle_type;
 
     size_t granularity;
     CUCHECK(cuMemGetAllocationGranularity(
@@ -72,6 +73,14 @@ static inline std::tuple<size_t, size_t, int> nvl_prepare(
     size_t allocated_size = (size + granularity - 1) / granularity * granularity;
 
     return {size, allocated_size, device_id};
+}
+
+static inline std::tuple<size_t, size_t, int> nvl_prepare(
+    const std::vector<int64_t> &shape,
+    at::ScalarType dtype
+) {
+    return nvl_prepare_for_handle_type(
+        shape, dtype, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
 }
 
 static inline at::Tensor make_external_cuda_tensor(
@@ -124,24 +133,20 @@ static inline at::Tensor make_vmm_tensor(
         ptr, nbytes, device_id, shape, dtype, std::move(deleter));
 }
 
-// Returns (keepalive VA tensor, exported POSIX fd, owned mem handle as int64).
-// The owned mem handle is not released here (kept for multicast cuMulticastBindMem);
-// the caller must call nvl_release_mem_handle when done (buffers that do not need
-// multicast release it immediately, matching the old behavior; buffers that need
-// multicast release it after bind).
-// The fd is used for cross-process IPC sharing (POSIX file descriptor); the caller
-// must close it after all peers have imported it.
-inline std::tuple<at::Tensor, int64_t, int64_t> nvl_dist_alloc(
+static inline std::tuple<at::Tensor, CUmemGenericAllocationHandle>
+nvl_dist_alloc_for_handle_type(
     const std::vector<int64_t> &chunk_shape,
-    at::ScalarType dtype
+    at::ScalarType dtype,
+    CUmemAllocationHandleType handle_type
 ) {
-    auto [nbytes, allocated_size, device_id] = nvl_prepare(chunk_shape, dtype);
+    auto [nbytes, allocated_size, device_id] =
+        nvl_prepare_for_handle_type(chunk_shape, dtype, handle_type);
 
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = device_id;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.requestedHandleTypes = handle_type;
 
     CUmemGenericAllocationHandle mem_handle;
     CUCHECK(cuMemCreate(&mem_handle, allocated_size, &prop, 0));
@@ -156,21 +161,40 @@ inline std::tuple<at::Tensor, int64_t, int64_t> nvl_dist_alloc(
     access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     CUCHECK(cuMemSetAccess(dptr, allocated_size, &access_desc, 1));
 
-    // Export the POSIX fd for other processes to import. Do not release
-    // mem_handle: keep the owned generic handle for multicast BindMem. The
-    // caller is responsible for nvl_release_mem_handle. The physical memory is
-    // referenced by the unicast map (keepalive) and (optionally) multicast;
-    // it is only truly freed after all unmaps once the handle is released.
+    auto keepalive = make_vmm_tensor(
+        reinterpret_cast<void *>(dptr), nbytes, allocated_size,
+        device_id, chunk_shape, dtype);
+    return {std::move(keepalive), mem_handle};
+}
+
+// Returns (keepalive VA tensor, exported POSIX fd, owned mem handle as int64).
+// The caller releases the owned handle after optional multicast binding, and
+// closes the fd after every peer has imported it.
+inline std::tuple<at::Tensor, int64_t, int64_t> nvl_dist_alloc(
+    const std::vector<int64_t> &chunk_shape,
+    at::ScalarType dtype
+) {
+    auto [keepalive, mem_handle] = nvl_dist_alloc_for_handle_type(
+        chunk_shape, dtype, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
     int fd = -1;
     CUCHECK(cuMemExportToShareableHandle(
         &fd, mem_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
     TORCH_CHECK(fd >= 0, "cuMemExportToShareableHandle returned invalid fd");
-
-    auto keepalive = make_vmm_tensor(
-        reinterpret_cast<void *>(dptr), nbytes, allocated_size,
-        device_id, chunk_shape, dtype);
-
     return {std::move(keepalive), static_cast<int64_t>(fd),
+            static_cast<int64_t>(mem_handle)};
+}
+
+inline std::tuple<at::Tensor, std::vector<uint8_t>, int64_t>
+nvl_dist_alloc_fabric(
+    const std::vector<int64_t> &chunk_shape,
+    at::ScalarType dtype
+) {
+    auto [keepalive, mem_handle] = nvl_dist_alloc_for_handle_type(
+        chunk_shape, dtype, CU_MEM_HANDLE_TYPE_FABRIC);
+    std::vector<uint8_t> fabric_handle(sizeof(CUmemFabricHandle));
+    CUCHECK(cuMemExportToShareableHandle(
+        fabric_handle.data(), mem_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    return {std::move(keepalive), std::move(fabric_handle),
             static_cast<int64_t>(mem_handle)};
 }
 
@@ -180,26 +204,16 @@ static inline void nvl_release_mem_handle(int64_t mem_handle_u64) {
     CUCHECK(cuMemRelease(static_cast<CUmemGenericAllocationHandle>(mem_handle_u64)));
 }
 
-/**
- * Map all chunk handles into a contiguous VA region.
- * Key difference from reference: ALL chunks get RW access (not just local_rank),
- * because dispatch needs to write to remote ranks' regions.
- *
- * `fds` are the POSIX fds exported by each rank via nvl_dist_alloc (passed
- * between processes by the caller, already valid in this process). The caller
- * may close the fds once they are imported.
- */
-inline at::Tensor nvl_dist_map(
+template <typename ImportHandle>
+static inline at::Tensor nvl_dist_map_impl(
     const std::vector<int64_t> &chunk_shape,
     at::ScalarType dtype,
-    const std::vector<int64_t> &fds,
-    int64_t local_rank,
-    int64_t world_size
+    int64_t world_size,
+    CUmemAllocationHandleType handle_type,
+    ImportHandle import_handle
 ) {
-    TORCH_CHECK((int64_t)fds.size() == world_size,
-        "fds.size()=", fds.size(), " != world_size=", world_size);
-
-    auto [chunk_nbytes, chunk_allocated_size, device_id] = nvl_prepare(chunk_shape, dtype);
+    auto [chunk_nbytes, chunk_allocated_size, device_id] =
+        nvl_prepare_for_handle_type(chunk_shape, dtype, handle_type);
 
     TORCH_CHECK(chunk_allocated_size == chunk_nbytes,
         "Chunk byte size (", chunk_nbytes, ") must be aligned to VMM granularity (",
@@ -212,13 +226,7 @@ inline at::Tensor nvl_dist_map(
     CUCHECK(cuMemAddressReserve(&dptr, total_allocated_size, 0, 0, 0));
 
     for (int64_t i = 0; i < world_size; i++) {
-        int fd = static_cast<int>(fds[i]);
-        CUmemGenericAllocationHandle mem_handle;
-        CUCHECK(cuMemImportFromShareableHandle(
-            &mem_handle,
-            reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
-
+        CUmemGenericAllocationHandle mem_handle = import_handle(i);
         CUdeviceptr chunk_va = dptr + i * chunk_allocated_size;
         CUCHECK(cuMemMap(chunk_va, chunk_allocated_size, 0, mem_handle, 0));
 
@@ -254,6 +262,60 @@ inline at::Tensor nvl_dist_map(
         full_shape, dtype, std::move(deleter));
 }
 
+/**
+ * Map all POSIX-fd chunks into one contiguous VA region with RW access.
+ * The caller may close each fd after this function imports it.
+ */
+inline at::Tensor nvl_dist_map(
+    const std::vector<int64_t> &chunk_shape,
+    at::ScalarType dtype,
+    const std::vector<int64_t> &fds,
+    int64_t local_rank,
+    int64_t world_size
+) {
+    TORCH_CHECK((int64_t)fds.size() == world_size,
+        "fds.size()=", fds.size(), " != world_size=", world_size);
+    return nvl_dist_map_impl(
+        chunk_shape, dtype, world_size,
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        [&fds](int64_t i) {
+            CUmemGenericAllocationHandle mem_handle;
+            int fd = static_cast<int>(fds[i]);
+            CUCHECK(cuMemImportFromShareableHandle(
+                &mem_handle,
+                reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+            return mem_handle;
+        });
+}
+
+// Fabric handles are ordinary bytes and can cross separate OS instances.
+inline at::Tensor nvl_dist_map_fabric(
+    const std::vector<int64_t> &chunk_shape,
+    at::ScalarType dtype,
+    const std::vector<std::vector<uint8_t>> &fabric_handles,
+    int64_t local_rank,
+    int64_t world_size
+) {
+    TORCH_CHECK((int64_t)fabric_handles.size() == world_size,
+        "fabric_handles.size()=", fabric_handles.size(),
+        " != world_size=", world_size);
+    return nvl_dist_map_impl(
+        chunk_shape, dtype, world_size, CU_MEM_HANDLE_TYPE_FABRIC,
+        [&fabric_handles](int64_t i) {
+            TORCH_CHECK(
+                fabric_handles[i].size() == sizeof(CUmemFabricHandle),
+                "invalid fabric handle size ", fabric_handles[i].size(),
+                ", expected ", sizeof(CUmemFabricHandle));
+            CUmemGenericAllocationHandle mem_handle;
+            CUCHECK(cuMemImportFromShareableHandle(
+                &mem_handle,
+                const_cast<uint8_t *>(fabric_handles[i].data()),
+                CU_MEM_HANDLE_TYPE_FABRIC));
+            return mem_handle;
+        });
+}
+
 // ============================================================
 // Multicast (NVSwitch SHARP) — register once, hold persistently
 // ============================================================
@@ -278,6 +340,36 @@ inline at::Tensor nvl_dist_map(
 //   all ranks: nvl_multicast_bind_map
 //   --- dist.barrier ---
 
+// Check both the device attribute and whether this process can actually create
+// a fabric allocation (the latter requires a usable IMEX channel).
+static inline bool nvl_fabric_supported() {
+    int device_id;
+    CUDACHECK(cudaGetDevice(&device_id));
+    CUdevice device;
+    CUCHECK(cuDeviceGet(&device, device_id));
+
+    int supported = 0;
+    CUCHECK(cuDeviceGetAttribute(
+        &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
+    if (!supported) return false;
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    size_t size = 0;
+    if (cuMemGetAllocationGranularity(
+            &size, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) return false;
+    CUCHECK(cuMemRelease(handle));
+    return true;
+}
+
 // Whether the device supports multicast.
 static inline bool nvl_multicast_supported() {
     int device_id;
@@ -292,11 +384,14 @@ static inline bool nvl_multicast_supported() {
 
 // Recommended multicast alignment granularity (bytes). Both the addr and size
 // of a bind must be aligned to it.
-static inline size_t nvl_multicast_granularity(int num_devices) {
+static inline size_t nvl_multicast_granularity_for_handle_type(
+    int num_devices,
+    CUmemAllocationHandleType handle_type
+) {
     CUmulticastObjectProp prop = {};
     prop.numDevices = static_cast<unsigned int>(num_devices);
     prop.size = 0;
-    prop.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.handleTypes = handle_type;
     prop.flags = 0;
     size_t gran = 0;
     CUCHECK(cuMulticastGetGranularity(
@@ -304,34 +399,52 @@ static inline size_t nvl_multicast_granularity(int num_devices) {
     return gran;
 }
 
+static inline size_t nvl_multicast_granularity(int num_devices) {
+    return nvl_multicast_granularity_for_handle_type(
+        num_devices, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+}
+
 static inline int64_t get_multicast_granularity(int64_t num_devices) {
     return static_cast<int64_t>(
         nvl_multicast_granularity(static_cast<int>(num_devices)));
 }
 
-// root only: create the multicast object and export a POSIX fd.
-// Returns (mc_handle as uint64, exported fd).
-// mc_handle is a handle value valid within this process; Python holds it and
-// passes it back unchanged to bind_map. The caller passes the fd to the other
-// ranks and closes it after all peers have imported it.
-inline std::tuple<int64_t, int64_t> nvl_multicast_create(
-    int64_t size_bytes, int64_t num_devices
+static inline int64_t get_multicast_granularity_fabric(int64_t num_devices) {
+    return static_cast<int64_t>(nvl_multicast_granularity_for_handle_type(
+        static_cast<int>(num_devices), CU_MEM_HANDLE_TYPE_FABRIC));
+}
+
+static inline CUmemGenericAllocationHandle
+nvl_multicast_create_for_handle_type(
+    int64_t size_bytes,
+    int64_t num_devices,
+    CUmemAllocationHandleType handle_type
 ) {
     TORCH_CHECK(nvl_multicast_supported(),
         "Multicast not supported on this device");
-    const size_t gran = nvl_multicast_granularity(static_cast<int>(num_devices));
+    const size_t gran = nvl_multicast_granularity_for_handle_type(
+        static_cast<int>(num_devices), handle_type);
     const size_t aligned =
         (static_cast<size_t>(size_bytes) + gran - 1) / gran * gran;
 
     CUmulticastObjectProp prop = {};
     prop.numDevices = static_cast<unsigned int>(num_devices);
     prop.size = aligned;
-    prop.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.handleTypes = handle_type;
     prop.flags = 0;
 
     CUmemGenericAllocationHandle mc_handle;
     CUCHECK(cuMulticastCreate(&mc_handle, &prop));
+    return mc_handle;
+}
 
+// Root creates the multicast object and exports a POSIX fd.
+inline std::tuple<int64_t, int64_t> nvl_multicast_create(
+    int64_t size_bytes, int64_t num_devices
+) {
+    CUmemGenericAllocationHandle mc_handle =
+        nvl_multicast_create_for_handle_type(
+            size_bytes, num_devices, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
     int fd = -1;
     CUCHECK(cuMemExportToShareableHandle(
         &fd, mc_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
@@ -347,6 +460,31 @@ inline int64_t nvl_multicast_import(int64_t fd) {
     CUCHECK(cuMemImportFromShareableHandle(
         &mc_handle, reinterpret_cast<void*>(static_cast<intptr_t>(fd)),
         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+    return static_cast<int64_t>(mc_handle);
+}
+
+inline std::tuple<int64_t, std::vector<uint8_t>> nvl_multicast_create_fabric(
+    int64_t size_bytes, int64_t num_devices
+) {
+    CUmemGenericAllocationHandle mc_handle =
+        nvl_multicast_create_for_handle_type(
+            size_bytes, num_devices, CU_MEM_HANDLE_TYPE_FABRIC);
+    std::vector<uint8_t> fabric_handle(sizeof(CUmemFabricHandle));
+    CUCHECK(cuMemExportToShareableHandle(
+        fabric_handle.data(), mc_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    return {static_cast<int64_t>(mc_handle), std::move(fabric_handle)};
+}
+
+inline int64_t nvl_multicast_import_fabric(
+    const std::vector<uint8_t> &fabric_handle
+) {
+    TORCH_CHECK(fabric_handle.size() == sizeof(CUmemFabricHandle),
+        "invalid fabric handle size ", fabric_handle.size(),
+        ", expected ", sizeof(CUmemFabricHandle));
+    CUmemGenericAllocationHandle mc_handle;
+    CUCHECK(cuMemImportFromShareableHandle(
+        &mc_handle, const_cast<uint8_t *>(fabric_handle.data()),
+        CU_MEM_HANDLE_TYPE_FABRIC));
     return static_cast<int64_t>(mc_handle);
 }
 
@@ -367,9 +505,10 @@ inline void nvl_multicast_add_device(int64_t mc_handle_u64) {
 // tensor holding the multicast VA (.data_ptr() is the multimem address). Uses
 // BindMem (owned handle) instead of BindAddr: BindAddr returns invalid
 // argument for IPC-imported VAs on this platform.
-inline at::Tensor nvl_multicast_bind_map(
+static inline at::Tensor nvl_multicast_bind_map_for_handle_type(
     int64_t mc_handle_u64, int64_t owned_mem_handle_u64,
-    int64_t size_bytes, int64_t num_devices
+    int64_t size_bytes, int64_t num_devices,
+    CUmemAllocationHandleType handle_type
 ) {
     int device_id;
     CUDACHECK(cudaGetDevice(&device_id));
@@ -378,7 +517,8 @@ inline at::Tensor nvl_multicast_bind_map(
     CUmemGenericAllocationHandle mem_handle =
         static_cast<CUmemGenericAllocationHandle>(owned_mem_handle_u64);
 
-    const size_t gran = nvl_multicast_granularity(static_cast<int>(num_devices));
+    const size_t gran = nvl_multicast_granularity_for_handle_type(
+        static_cast<int>(num_devices), handle_type);
     TORCH_CHECK(static_cast<size_t>(size_bytes) % gran == 0,
         "multicast bind size (", size_bytes, ") must be a multiple of multicast "
         "granularity (", gran, "); pad meta_buf chunk accordingly");
@@ -417,4 +557,22 @@ inline at::Tensor nvl_multicast_bind_map(
     return make_external_cuda_tensor(
         reinterpret_cast<void*>(mc_va), size, device_id,
         shape, at::kInt, std::move(deleter));
+}
+
+inline at::Tensor nvl_multicast_bind_map(
+    int64_t mc_handle_u64, int64_t owned_mem_handle_u64,
+    int64_t size_bytes, int64_t num_devices
+) {
+    return nvl_multicast_bind_map_for_handle_type(
+        mc_handle_u64, owned_mem_handle_u64, size_bytes, num_devices,
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+}
+
+inline at::Tensor nvl_multicast_bind_map_fabric(
+    int64_t mc_handle_u64, int64_t owned_mem_handle_u64,
+    int64_t size_bytes, int64_t num_devices
+) {
+    return nvl_multicast_bind_map_for_handle_type(
+        mc_handle_u64, owned_mem_handle_u64, size_bytes, num_devices,
+        CU_MEM_HANDLE_TYPE_FABRIC);
 }

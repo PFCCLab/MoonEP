@@ -24,7 +24,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import make_ptr
 
-from moonep._common import cp_async_bulk_g2s, cross_rank_barrier, grid_sync
+from moonep._common import (
+    cp_async_bulk_g2s,
+    cross_rank_barrier,
+    current_cuda_stream_handle,
+    grid_sync,
+)
 from moonep.constants import KIDX_BITS
 
 
@@ -1179,7 +1184,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         return make_ptr(Int32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     def p4(t):  # odd-length outputs like E+B; avoids out-of-bounds vector writes
         return make_ptr(Int32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
     comp(
         p16(tpe),
         p16(topk),

@@ -25,6 +25,8 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 from cutlass import BFloat16, Int32, Int64
 from cutlass.cute.runtime import make_ptr
 
+from moonep._common import current_cuda_stream_handle
+
 
 class PrefetchKernel:
     """Persistent 2D TMA remote-expert prefetch."""
@@ -380,6 +382,6 @@ def launch_prefetch(
         cute.AddressSpace.gmem,
         assumed_align=4,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     compiled(src_ptr, dst_ptr, experts_ptr, stream)

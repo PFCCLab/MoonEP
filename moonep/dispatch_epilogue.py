@@ -32,6 +32,7 @@ from cutlass.cute.runtime import make_ptr
 from moonep._common import (
     cp_async_bulk_g2s,
     cp_async_bulk_s2g,
+    current_cuda_stream_handle,
     pdl_wait_predecessor,
 )
 from moonep.planning import MoonEPCommPlan
@@ -405,7 +406,7 @@ def launch_dispatch_epilogue(
     dup_counts_ptr = make_ptr(Int32, plan.dup_counts.data_ptr(),
                               cute.AddressSpace.gmem, assumed_align=8)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     epilogue_compiled(
         hbf_local_ptr,

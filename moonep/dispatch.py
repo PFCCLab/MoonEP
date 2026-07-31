@@ -29,6 +29,7 @@ from moonep._common import (
     cp_async_bulk_s2g,
     cross_rank_barrier,
     cross_warp_sync,
+    current_cuda_stream_handle,
     atom_add_relaxed_gpu_s32,
     atom_min_relaxed_gpu_s32,
     atom_or_relaxed_gpu_b32,
@@ -960,7 +961,7 @@ def launch_dispatch(
     dup_counts_ptr = make_ptr(Int32, plan.dup_counts.data_ptr(),
                               cute.AddressSpace.gmem, assumed_align=8)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(current_cuda_stream_handle())
 
     dispatch_compiled(
         hsh_ptr,

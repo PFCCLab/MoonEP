@@ -8,6 +8,8 @@ Run with:
     torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -22,15 +24,32 @@ from tests.kernel_test_utils import (
 from tests.rng_utils import seeded_cuda_rng
 
 
+def _local_rank():
+    for name in (
+        "LOCAL_RANK",
+        "PADDLE_LOCAL_RANK",
+        "PADDLE_RANK_IN_NODE",
+        "RANK",
+        "PADDLE_TRAINER_ID",
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            return int(value)
+    raise RuntimeError("distributed launcher did not set a rank environment variable")
+
+
 def setup():
-    dist.init_process_group(backend="nccl")
+    local_rank = _local_rank()
+    torch.cuda.set_device(local_rank)
+    # TODO(Paddle compat): use init_process_group once the
+    # torch.distributed proxy provides it.
+    dist.init_parallel_env()
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
     return rank, dist.get_world_size()
 
 
 def make_inputs(rank, S, H, K, E, seed=0):
-    dev = f"cuda:{rank}"
+    dev = f"cuda:{torch.cuda.current_device()}"
     with seeded_cuda_rng(seed + rank, dev):
         hidden = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
         weights = torch.rand(S, K, dtype=torch.float32, device=dev)
@@ -40,7 +59,7 @@ def make_inputs(rank, S, H, K, E, seed=0):
 
 
 def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
-    dev = f"cuda:{rank}"
+    dev = f"cuda:{torch.cuda.current_device()}"
     padded_E = pad_dim0_for_alignment([E, H, Hp], torch.bfloat16)
     owners = []
     for owner in range(R):
@@ -69,7 +88,7 @@ def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
 
 def make_full_weight(rank, remote_expert, B, source_offset):
     E, H, Hp = remote_expert.shape
-    dev = f"cuda:{rank}"
+    dev = f"cuda:{torch.cuda.current_device()}"
     full_weight = torch.empty(E + B, H, Hp, dtype=torch.bfloat16, device=dev)
     full_weight[:E].copy_(remote_expert)
     if source_offset:
@@ -135,7 +154,7 @@ def reduce_base(R, B, H, Hp, offset, dev):
 
 
 def make_grad_reduce_args(rank, R, E, B, H, Hp, offsets):
-    dev = f"cuda:{rank}"
+    dev = f"cuda:{torch.cuda.current_device()}"
     full_E = E + B
     return {
         "full_gate_grad": grad_base(full_E, H, Hp, offsets[0], dev).contiguous(),
@@ -148,7 +167,7 @@ def make_grad_reduce_args(rank, R, E, B, H, Hp, offsets):
 
 
 def expected_local_grad(rank, R, E, H, Hp, full_offset, reduce_offset, experts_to_copy):
-    dev = f"cuda:{rank}"
+    dev = f"cuda:{torch.cuda.current_device()}"
     expected = grad_base(E, H, Hp, full_offset, dev)
     reduce_vals = reduce_base(R, experts_to_copy.shape[1], H, Hp, reduce_offset, dev)
     for src_rank in range(R):
