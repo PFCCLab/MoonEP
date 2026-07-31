@@ -191,6 +191,26 @@ torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
 ```
 
+### MNNVL Support
+
+MNNVL mode replaces only the VMM handle transport with CUDA fabric handles;
+the kernels and buffer layout are unchanged. It is opt-in, so the existing
+POSIX-fd path remains the default. All ranks must set the variable consistently,
+and the container must expose a working IMEX channel.
+
+```bash
+export MOONEP_USE_MNNVL=1
+
+# Checks both the fabric device attribute and an actual fabric allocation.
+python -c "from moonep.buffer import mnnvl_available; print(mnnvl_available())"
+
+# Focused fabric unicast + multicast test.
+torchrun --nproc_per_node=4 -m pytest tests/test_mnnvl.py
+
+# Multi-node: run on every node with its zero-based NODE_RANK.
+MOONEP_USE_MNNVL=1 torchrun --nnodes=2 --nproc_per_node=4 --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR --master_port=29500 -m pytest tests/test_mnnvl.py
+```
+
 ## Acknowledgments
 
 This library is inspired by the following works:
