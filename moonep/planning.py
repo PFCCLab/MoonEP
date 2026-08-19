@@ -435,8 +435,7 @@ class PlanningKernel:
                 off = chunk + p
                 if off < N:
                     expert = topk_in[off]
-                    # cute.arch.atomic_add(elem_ptr(s_histogram, expert), 1, scope="cta")
-                    cute.arch.atomic_add(elem_ptr(s_histogram, expert).llvm_ptr, 1, scope="cta")
+                    cute.arch.atomic_add(elem_ptr(s_histogram, expert), 1, scope="cta")
 
             cute.arch.barrier()
 
@@ -490,13 +489,11 @@ class PlanningKernel:
             for i in cutlass.range_constexpr(IPT):
                 peers = match_any_b32(my_e[i])
                 cell = elem_ptr(s_warp_counts, (my_e[i], warp))
-                # base = cute.arch.load(cell, Int32)
-                base = cute.arch.load(cell.llvm_ptr, Int32)
+                base = cute.arch.load(cell, Int32)
                 ww.append(base + Int32(cute.arch.popc(peers & lanes_lt)))
                 cute.arch.sync_warp()
                 if (peers & lanes_lt) == Uint32(0):
-                    # cute.arch.store(cell, base + Int32(cute.arch.popc(peers)))
-                    cute.arch.store(cell.llvm_ptr, base + Int32(cute.arch.popc(peers)))
+                    cute.arch.store(cell, base + Int32(cute.arch.popc(peers)))
                 cute.arch.sync_warp()
             cute.arch.barrier()
 
@@ -660,8 +657,7 @@ class PlanningKernel:
                         run = 0
                         for r in cutlass.range_constexpr(R):
                             run += s_tpe[r, tid]; s_tpe[r, tid] = run
-                        # cute.arch.atomic_add(group_tokens.iterator + expert_idx // epn, run, scope="gpu")
-                        cute.arch.atomic_add((group_tokens.iterator + expert_idx // epn).llvm_ptr, run, scope="gpu")
+                        cute.arch.atomic_add(group_tokens.iterator + expert_idx // epn, run, scope="gpu")
                 cute.arch.barrier()
 
                 # Write the prefix sums back to meta; step3 queries them by rank/expert.
@@ -880,8 +876,7 @@ class PlanningKernel:
                             if expert_idx >= 0:
                                 owner_rank = expert_idx // epn
                                 cute.arch.atomic_add(
-                                    # elem_ptr(all_remote_stats, (owner_rank, 1)),
-                                    elem_ptr(all_remote_stats, (owner_rank, 1)).llvm_ptr,
+                                    elem_ptr(all_remote_stats, (owner_rank, 1)),
                                     1,
                                     scope="gpu",
                                 )

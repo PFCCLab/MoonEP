@@ -322,11 +322,7 @@ def cross_rank_barrier(
             red_add_release_sys(peer.ir_value(), delta)
         cute.arch.sync_threads()
         if tid == 0:
-            # cute.arch.atomic_add(meta_buf.iterator + (rank * meta_stride + barrier_off + 2), Int32(1), scope="gpu")
-            # CUTLASS DSL 4.4.2 accepts status_ptr directly; 4.4.1 needs
-            # the underlying MLIR pointer.
-            status_ptr = meta_buf.iterator + (rank * meta_stride + barrier_off + 2)
-            cute.arch.atomic_add(status_ptr.llvm_ptr, Int32(1), scope="gpu")
+            cute.arch.atomic_add(meta_buf.iterator + (rank * meta_stride + barrier_off + 2), Int32(1), scope="gpu")
             target = Int32(num_ranks)
             if sign != 0:
                 target = Int32(0)
